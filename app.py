@@ -86,7 +86,33 @@ def load_model():
 
     return model, content_matrix
 
+def search_books(query, limit=30):
+    if not query or not query.strip():
+        return books.iloc[0:0].copy()
 
+    query = query.strip().lower()
+
+    title_match = (
+        books["title"]
+        .fillna("")
+        .astype(str)
+        .str.lower()
+        .str.contains(query, regex=False)
+    )
+
+    author_match = (
+        books["author"]
+        .fillna("")
+        .astype(str)
+        .str.lower()
+        .str.contains(query, regex=False)
+    )
+
+    results = books[
+        title_match | author_match
+    ].copy()
+
+    return results.head(limit)
 books = load_books()
 
 model, content_matrix = (

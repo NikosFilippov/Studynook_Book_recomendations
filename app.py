@@ -515,16 +515,43 @@ elif page == "🔎 Find a Book":
 
         book_options = {}
 
-        for _, row in results.iterrows():
+        book_options = {}
 
+    for _, row in results.iterrows():
+    
+        title = str(row["title"])
+        author = str(row["author"])
+    
+        book_format = row.get(
+            "bookformat",
+            ""
+        )
+    
+        if pd.isna(book_format):
+            book_format = ""
+    
+        book_format = str(
+            book_format
+        ).strip()
+    
+        if book_format:
+    
             label = (
-                f"{row['title']} "
-                f"— {row['author']}"
+                f"{title} — "
+                f"{author} — "
+                f"{book_format}"
             )
-
-            book_options[
-                int(row["book_id"])
-            ] = label
+    
+        else:
+    
+            label = (
+                f"{title} — "
+                f"{author}"
+            )
+    
+        book_options[
+            int(row["book_id"])
+        ] = label
 
 
         selected_id = st.selectbox(

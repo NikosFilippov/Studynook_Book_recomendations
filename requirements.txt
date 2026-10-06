@@ -1,7 +1,8 @@
-joblib
-pandas
 streamlit
-os  
+pandas
+numpy
+scipy
+scikit-learn
+joblib
 supabase
-create_client
-scipy.sparse
+pyarrow

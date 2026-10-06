@@ -194,3 +194,137 @@ on public.book_ratings(user_id);
 create index if not exists
 idx_feedback_user
 on public.recommendation_feedback(user_id);
+-- ============================================================
+-- ROW LEVEL SECURITY
+-- ============================================================
+
+alter table public.books
+enable row level security;
+
+
+alter table public.editions
+enable row level security;
+
+
+alter table public.reading_history
+enable row level security;
+
+
+alter table public.book_ratings
+enable row level security;
+
+
+alter table public.recommendation_feedback
+enable row level security;
+
+
+-- ============================================================
+-- BOOKS
+-- ============================================================
+
+create policy "Anyone can read books"
+on public.books
+for select
+to anon, authenticated
+using (true);
+
+
+-- ============================================================
+-- EDITIONS
+-- ============================================================
+
+create policy "Anyone can read editions"
+on public.editions
+for select
+to anon, authenticated
+using (true);
+
+
+-- ============================================================
+-- READING HISTORY
+-- ============================================================
+
+create policy "Users can view their reading history"
+on public.reading_history
+for select
+to authenticated
+using (
+    auth.uid() = user_id
+);
+
+
+create policy "Users can insert their reading history"
+on public.reading_history
+for insert
+to authenticated
+with check (
+    auth.uid() = user_id
+);
+
+
+create policy "Users can update their reading history"
+on public.reading_history
+for update
+to authenticated
+using (
+    auth.uid() = user_id
+)
+with check (
+    auth.uid() = user_id
+);
+
+
+-- ============================================================
+-- RATINGS
+-- ============================================================
+
+create policy "Users can view their ratings"
+on public.book_ratings
+for select
+to authenticated
+using (
+    auth.uid() = user_id
+);
+
+
+create policy "Users can insert their ratings"
+on public.book_ratings
+for insert
+to authenticated
+with check (
+    auth.uid() = user_id
+);
+
+
+create policy "Users can update their ratings"
+on public.book_ratings
+for update
+to authenticated
+using (
+    auth.uid() = user_id
+)
+with check (
+    auth.uid() = user_id
+);
+
+
+-- ============================================================
+-- RECOMMENDATION FEEDBACK
+-- ============================================================
+
+create policy "Users can view their feedback"
+on public.recommendation_feedback
+for select
+to authenticated
+using (
+    auth.uid() = user_id
+);
+
+
+create policy "Users can insert their feedback"
+on public.recommendation_feedback
+for insert
+to authenticated
+with check (
+    auth.uid() = user_id
+);

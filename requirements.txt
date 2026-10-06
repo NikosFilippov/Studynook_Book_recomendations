@@ -1,0 +1,7 @@
+joblib
+pandas
+streamlit
+os  
+supabase
+create_client
+scipy.sparse

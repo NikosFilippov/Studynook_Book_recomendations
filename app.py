@@ -623,7 +623,7 @@ elif page == "🔎 Find a Book":
                 "Book selected!"
             )
 
-if "source_book_id" in st.session_state:
+if st.session_state.get("source_book_id") is not None:
 
     selected_id = (
         st.session_state["source_book_id"]

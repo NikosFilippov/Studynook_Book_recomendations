@@ -1,70 +1,59 @@
 import os
-
 import joblib
 import pandas as pd
 import streamlit as st
 
 from scipy.sparse import load_npz
-
 from supabase import create_client
 
 
 # ============================================================
-# PAGE
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
-    page_title="Book Recommender",
+    page_title="StudyNook Book Recommender",
     page_icon="📚",
     layout="wide"
 )
 
 
 # ============================================================
-# SUPABASE
+# SUPABASE CONNECTION
 # ============================================================
 
-SUPABASE_URL = st.secrets[
-    "SUPABASE_URL"
-]
+@st.cache_resource
+def get_supabase():
 
-SUPABASE_KEY = st.secrets[
-    "SUPABASE_KEY"
-]
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
 
-supabase = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY
-)
+    except Exception:
+        st.error(
+            """
+            Supabase credentials are missing.
+
+            Add SUPABASE_URL and SUPABASE_KEY
+            to Streamlit Secrets.
+            """
+        )
+        st.stop()
+
+    return create_client(
+        url,
+        key
+    )
 
 
+supabase = get_supabase()
+
+
+# ============================================================
+# MODEL ARTIFACTS
+# ============================================================
 
 ARTIFACT_DIR = "artifacts"
-
-
-@st.cache_data
-def load_books():
-
-    books = pd.read_parquet(
-        os.path.join(
-            ARTIFACT_DIR,
-            "books.parquet"
-        )
-    )
-
-    books["genre_list"] = (
-        books["genre_list"]
-        .fillna("")
-        .apply(
-            lambda x: [
-                g
-                for g in str(x).split("||")
-                if g
-            ]
-        )
-    )
-
-    return books
 
 
 @st.cache_resource
@@ -84,40 +73,311 @@ def load_model():
         )
     )
 
-    return model, content_matrix
+    matrix_book_ids = joblib.load(
+        os.path.join(
+            ARTIFACT_DIR,
+            "matrix_book_ids.joblib"
+        )
+    )
 
-def search_books(query, limit=30):
+    return (
+        model,
+        content_matrix,
+        matrix_book_ids
+    )
+
+
+model, content_matrix, matrix_book_ids = load_model()
+
+
+# ============================================================
+# SUPABASE BOOK FUNCTIONS
+# ============================================================
+
+def search_editions(
+    query,
+    limit=30
+):
+
     if not query or not query.strip():
-        return books.iloc[0:0].copy()
 
-    query = query.strip().lower()
+        return pd.DataFrame()
 
-    title_match = (
-        books["title"]
-        .fillna("")
-        .astype(str)
-        .str.lower()
-        .str.contains(query, regex=False)
+    query = query.strip()
+
+    response = (
+        supabase
+        .table("editions")
+        .select(
+            """
+            edition_id,
+            book_id,
+            title,
+            author,
+            bookformat,
+            isbn,
+            isbn13,
+            pages,
+            rating,
+            totalratings,
+            img
+            """
+        )
+        .or_(
+            f"title.ilike.%{query}%,"
+            f"author.ilike.%{query}%"
+        )
+        .limit(limit)
+        .execute()
     )
 
-    author_match = (
-        books["author"]
-        .fillna("")
-        .astype(str)
-        .str.lower()
-        .str.contains(query, regex=False)
+    if not response.data:
+
+        return pd.DataFrame()
+
+    return pd.DataFrame(
+        response.data
     )
 
-    results = books[
-        title_match | author_match
-    ].copy()
 
-    return results.head(limit)
-books = load_books()
+def get_book(
+    book_id
+):
 
-model, content_matrix = (
-    load_model()
-)
+    response = (
+        supabase
+        .table("books")
+        .select("*")
+        .eq(
+            "book_id",
+            int(book_id)
+        )
+        .limit(1)
+        .execute()
+    )
+
+    if not response.data:
+
+        return None
+
+    return response.data[0]
+
+
+def get_books(
+    book_ids
+):
+
+    if not book_ids:
+
+        return pd.DataFrame()
+
+    book_ids = [
+        int(x)
+        for x in book_ids
+    ]
+
+    response = (
+        supabase
+        .table("books")
+        .select("*")
+        .in_(
+            "book_id",
+            book_ids
+        )
+        .execute()
+    )
+
+    if not response.data:
+
+        return pd.DataFrame()
+
+    return pd.DataFrame(
+        response.data
+    )
+
+
+def get_editions_for_book(
+    book_id
+):
+
+    response = (
+        supabase
+        .table("editions")
+        .select(
+            """
+            edition_id,
+            book_id,
+            title,
+            author,
+            bookformat,
+            isbn,
+            isbn13,
+            pages,
+            rating,
+            totalratings,
+            img
+            """
+        )
+        .eq(
+            "book_id",
+            int(book_id)
+        )
+        .limit(50)
+        .execute()
+    )
+
+    if not response.data:
+
+        return pd.DataFrame()
+
+    return pd.DataFrame(
+        response.data
+    )
+
+
+# ============================================================
+# RECOMMENDATION FUNCTION
+# ============================================================
+
+def recommend_books(
+    book_id,
+    n=10
+):
+
+    book_id = int(book_id)
+
+    # --------------------------------------------------------
+    # Find the row of this book inside the ML matrix
+    # --------------------------------------------------------
+
+    try:
+
+        row_position = (
+            matrix_book_ids.index(
+                book_id
+            )
+        )
+
+    except ValueError:
+
+        return pd.DataFrame()
+
+
+    # --------------------------------------------------------
+    # Get nearest neighbours
+    # --------------------------------------------------------
+
+    distances, indices = (
+        model.kneighbors(
+            content_matrix[
+                row_position
+            ],
+            n_neighbors=min(
+                n + 1,
+                content_matrix.shape[0]
+            )
+        )
+    )
+
+
+    distances = distances[0]
+    indices = indices[0]
+
+
+    # --------------------------------------------------------
+    # Convert matrix rows back to book IDs
+    # --------------------------------------------------------
+
+    recommended_ids = []
+
+    similarities = []
+
+
+    for distance, index in zip(
+        distances,
+        indices
+    ):
+
+        recommended_book_id = int(
+            matrix_book_ids[index]
+        )
+
+        # Remove the selected book itself
+
+        if recommended_book_id == book_id:
+            continue
+
+        recommended_ids.append(
+            recommended_book_id
+        )
+
+        similarities.append(
+            max(
+                0,
+                1 - float(distance)
+            )
+        )
+
+        if len(recommended_ids) >= n:
+            break
+
+
+    # --------------------------------------------------------
+    # Retrieve metadata from Supabase
+    # --------------------------------------------------------
+
+    recommendations = get_books(
+        recommended_ids
+    )
+
+
+    if recommendations.empty:
+
+        return recommendations
+
+
+    # --------------------------------------------------------
+    # Restore recommendation order
+    # --------------------------------------------------------
+
+    order = {
+        book_id: position
+        for position, book_id
+        in enumerate(recommended_ids)
+    }
+
+    similarity_map = {
+        book_id: similarity
+        for book_id, similarity
+        in zip(
+            recommended_ids,
+            similarities
+        )
+    }
+
+
+    recommendations[
+        "_order"
+    ] = recommendations[
+        "book_id"
+    ].map(order)
+
+
+    recommendations[
+        "similarity"
+    ] = recommendations[
+        "book_id"
+    ].map(similarity_map)
+
+
+    recommendations = (
+        recommendations
+        .sort_values("_order")
+        .drop(columns="_order")
+    )
+
+
+    return recommendations
 
 
 # ============================================================
@@ -125,21 +385,32 @@ model, content_matrix = (
 # ============================================================
 
 if "user" not in st.session_state:
+
     st.session_state.user = None
 
+
 if "source_book_id" not in st.session_state:
+
     st.session_state.source_book_id = None
 
 
 # ============================================================
-# AUTHENTICATION
+# LOGIN
 # ============================================================
 
 def login():
 
     st.title(
-        "📚 Book Recommender"
+        "📚 StudyNook Book Recommender"
     )
+
+    st.write(
+        """
+        Find books you like and discover
+        similar books using our recommendation model.
+        """
+    )
+
 
     login_tab, signup_tab = st.tabs(
         [
@@ -166,6 +437,7 @@ def login():
             key="login_password"
         )
 
+
         if st.button(
             "Login",
             type="primary"
@@ -184,15 +456,18 @@ def login():
                     )
                 )
 
+
                 st.session_state.user = (
                     response.user
                 )
+
 
                 st.success(
                     "Successfully logged in."
                 )
 
                 st.rerun()
+
 
             except Exception as e:
 
@@ -218,6 +493,7 @@ def login():
             key="signup_password"
         )
 
+
         if st.button(
             "Create account"
         ):
@@ -235,11 +511,16 @@ def login():
                     )
                 )
 
+
                 st.success(
-                    "Account created. "
-                    "Check your email if confirmation "
-                    "is enabled in Supabase."
+                    """
+                    Account created.
+
+                    Check your email if email
+                    confirmation is enabled.
+                    """
                 )
+
 
             except Exception as e:
 
@@ -247,6 +528,10 @@ def login():
                     f"Could not create account: {e}"
                 )
 
+
+# ============================================================
+# SHOW LOGIN IF NOT LOGGED IN
+# ============================================================
 
 if st.session_state.user is None:
 
@@ -261,164 +546,13 @@ user_id = user.id
 
 
 # ============================================================
-# SEARCH
-# ============================================================
-
-query = st.text_input(
-    "Search for a book",
-    placeholder="Enter a book title, e.g. Inferno"
-)
-
-if query:
-
-    results = search_books(query, limit=30)
-
-    if results.empty:
-
-        st.warning(
-            "No books found."
-        )
-
-    else:
-
-        st.write(
-            f"Found {len(results)} matching books:"
-        )
-
-        for _, book in results.iterrows():
-
-            book_id = int(book["book_id"])
-
-            # ------------------------------------------------
-            # EACH BOOK HAS ITS OWN CONTAINER
-            # ------------------------------------------------
-
-            with st.container(border=True):
-
-                st.subheader(
-                    book["title"]
-                )
-
-                st.write(
-                    f"**Author:** {book['author']}"
-                )
-
-                if pd.notna(
-                    book["rating_clean"]
-                ):
-
-                    st.write(
-                        f"Goodreads rating: "
-                        f"{book['rating_clean']:.2f} ⭐"
-                    )
-
-                if book["genre_list"]:
-
-                    st.write(
-                        "Genres: "
-                        + ", ".join(
-                            book["genre_list"]
-                        )
-                    )
-
-                # ------------------------------------------------
-                # THIS IS THE IMPORTANT PART
-                # ------------------------------------------------
-
-                if st.button(
-                    "Select this book",
-                    key=f"select_book_{book_id}"
-                ):
-
-                    st.session_state[
-                        "source_book_id"
-                    ] = book_id
-
-                    st.session_state[
-                        "selected_book"
-                    ] = book
-
-                    st.success(
-                        f"Selected: "
-                        f"{book['title']} — "
-                        f"{book['author']}"
-                    )
-
-                    st.rerun()
-
-# ============================================================
-# RECOMMENDATIONS
-# ============================================================
-
-def recommend_books(
-    book_id,
-    n=10
-):
-
-    matches = books.index[
-        books["book_id"] == book_id
-    ]
-
-    if len(matches) == 0:
-
-        return books.iloc[0:0]
-
-
-    row_position = (
-        books.index.get_loc(
-            matches[0]
-        )
-    )
-
-
-    distances, indices = (
-        model.kneighbors(
-            content_matrix[
-                row_position
-            ],
-            n_neighbors=min(
-                n + 1,
-                len(books)
-            )
-        )
-    )
-
-
-    recommendations = (
-        books.iloc[
-            indices[0]
-        ].copy()
-    )
-
-
-    recommendations[
-        "similarity"
-    ] = 1 - distances[0]
-
-
-    recommendations = (
-        recommendations[
-            recommendations["book_id"]
-            != book_id
-        ]
-    )
-
-
-    return recommendations.head(n)
-
-
-# ============================================================
 # SIDEBAR
 # ============================================================
 
 with st.sidebar:
 
     st.title(
-        "📚 Book Recommender"
-    )
-
-    st.write(
-        f"Logged in as:"
+        "📚 StudyNook"
     )
 
     st.caption(
@@ -438,11 +572,19 @@ with st.sidebar:
     )
 
 
+    st.divider()
+
+
     if st.button(
         "Logout"
     ):
 
-        supabase.auth.sign_out()
+        try:
+            supabase.auth.sign_out()
+
+        except Exception:
+            pass
+
 
         st.session_state.user = None
 
@@ -458,29 +600,53 @@ with st.sidebar:
 if page == "🏠 Home":
 
     st.title(
-        "📚 Goodreads Book Recommender"
+        "📚 StudyNook Book Recommender"
     )
 
     st.write(
         """
         Search for a book and receive recommendations
-        based on the trained recommendation model.
+        based on content similarity and the Nearest
+        Neighbours model.
         """
     )
 
+
     st.info(
         """
-        Books are identified using a unique `book_id`.
-        The title alone is never used as the identity.
+        You can select a specific edition of a book.
 
-        Therefore books with the same title but different
-        authors remain separate.
+        The recommendation model works at the
+        work level, so different editions of the
+        same work lead to the same recommendation
+        set.
+        """
+    )
+
+
+    st.subheader(
+        "How it works"
+    )
+
+
+    st.write(
+        """
+        1. Search for a book.
+
+        2. Select the exact edition you want.
+
+        3. The selected edition is connected to its
+           underlying book/work.
+
+        4. Nearest Neighbours finds similar books.
+
+        5. You can rate the recommendations.
         """
     )
 
 
 # ============================================================
-# FIND BOOK
+# FIND A BOOK
 # ============================================================
 
 elif page == "🔎 Find a Book":
@@ -489,176 +655,224 @@ elif page == "🔎 Find a Book":
         "🔎 Find a Book"
     )
 
-    query = st.text_input(
-        "Search by title or author",
-        placeholder="Try: Inferno"
-    )
-
-
-    results = search_books(
-        query
-    )
-
-
-    if query and results.empty:
-
-        st.warning(
-            "No books found."
-        )
-
-
-    if not results.empty:
-
-        # IMPORTANT:
-        # The value displayed to the user contains
-        # BOTH title and author.
-
-        book_options = {}
-
-        book_options = {}
-
-    for _, row in results.iterrows():
-    
-        title = str(row["title"])
-        author = str(row["author"])
-    
-        book_format = row.get(
-            "bookformat",
-            ""
-        )
-    
-        if pd.isna(book_format):
-            book_format = ""
-    
-        book_format = str(
-            book_format
-        ).strip()
-    
-        if book_format:
-    
-            label = (
-                f"{title} — "
-                f"{author} — "
-                f"{book_format}"
-            )
-    
-        else:
-    
-            label = (
-                f"{title} — "
-                f"{author}"
-            )
-    
-        book_options[
-            int(row["book_id"])
-        ] = label
-
-
-        selected_id = st.selectbox(
-            "Select the exact book",
-            list(
-                book_options.keys()
-            ),
-            format_func=lambda x:
-                book_options[x]
-        )
-
-
-        selected = books.loc[
-            books["book_id"] == selected_id
-        ].iloc[0]
-
-
-        st.divider()
-
-
-        st.subheader(
-            selected["title"]
-        )
-
-        st.write(
-            f"**Author:** "
-            f"{selected['author']}"
-        )
-
-
-        if pd.notna(
-            selected["pages_clean"]
-        ):
-
-            st.write(
-                f"**Pages:** "
-                f"{int(selected['pages_clean'])}"
-            )
-
-
-        if pd.notna(
-            selected["rating_clean"]
-        ):
-
-            st.write(
-                f"**Goodreads rating:** "
-                f"{selected['rating_clean']:.2f}"
-            )
-
-
-        if selected["genre_list"]:
-
-            st.write(
-                f"**Genres:** "
-                f"{', '.join(selected['genre_list'])}"
-            )
-
-
-        if st.button(
-            "Use this book",
-            type="primary"
-        ):
-
-            st.session_state.source_book_id = (
-                selected_id
-            )
-
-            st.success(
-                "Book selected!"
-            )
-
-if st.session_state.get("source_book_id") is not None:
-
-    selected_id = (
-        st.session_state["source_book_id"]
-    )
-
-    selected_book = books[
-        books["book_id"] == selected_id
-    ].iloc[0]
-
-    st.divider()
-
-    st.subheader(
-        "Selected book"
-    )
 
     st.write(
-        f"**{selected_book['title']}** "
-        f"— {selected_book['author']}"
+        """
+        Search by title or author.
+        """
     )
 
-    if st.button(
-        "📚 Get recommendations",
-        type="primary"
-    ):
 
-        recommendations = recommend_books(
-            selected_id,
-            n=10
+    query = st.text_input(
+        "Book search",
+        placeholder="Try: Harry Potter, Animal Farm, Dan Brown..."
+    )
+
+
+    if query:
+
+        results = search_editions(
+            query,
+            limit=30
         )
 
-        st.session_state[
-            "recommendations"
-        ] = recommendations
 
-        st.rerun()
+        if results.empty:
+
+            st.warning(
+                "No books found."
+            )
+
+
+        else:
+
+            st.write(
+                f"Found {len(results)} results."
+            )
+
+
+            options = {}
+
+
+            for _, row in results.iterrows():
+
+                edition_id = int(
+                    row["edition_id"]
+                )
+
+
+                title = str(
+                    row["title"]
+                )
+
+
+                author = str(
+                    row["author"]
+                )
+
+
+                bookformat = row.get(
+                    "bookformat",
+                    ""
+                )
+
+
+                isbn = row.get(
+                    "isbn",
+                    ""
+                )
+
+
+                if pd.isna(bookformat):
+
+                    bookformat = ""
+
+
+                if pd.isna(isbn):
+
+                    isbn = ""
+
+
+                label = (
+                    f"{title} — {author}"
+                )
+
+
+                if str(
+                    bookformat
+                ).strip():
+
+                    label += (
+                        f" — {bookformat}"
+                    )
+
+
+                if str(
+                    isbn
+                ).strip():
+
+                    label += (
+                        f" — ISBN {isbn}"
+                    )
+
+
+                options[
+                    edition_id
+                ] = label
+
+
+            selected_edition_id = (
+                st.selectbox(
+                    "Select the exact edition",
+                    list(
+                        options.keys()
+                    ),
+                    format_func=lambda x:
+                        options[x]
+                )
+            )
+
+
+            selected_edition = (
+                results[
+                    results[
+                        "edition_id"
+                    ]
+                    == selected_edition_id
+                ]
+                .iloc[0]
+            )
+
+
+            st.divider()
+
+
+            st.subheader(
+                selected_edition[
+                    "title"
+                ]
+            )
+
+
+            st.write(
+                f"**Author:** "
+                f"{selected_edition['author']}"
+            )
+
+
+            if pd.notna(
+                selected_edition.get(
+                    "bookformat"
+                )
+            ):
+
+                st.write(
+                    f"**Format:** "
+                    f"{selected_edition['bookformat']}"
+                )
+
+
+            if pd.notna(
+                selected_edition.get(
+                    "isbn"
+                )
+            ):
+
+                st.write(
+                    f"**ISBN:** "
+                    f"{selected_edition['isbn']}"
+                )
+
+
+            if pd.notna(
+                selected_edition.get(
+                    "pages"
+                )
+            ):
+
+                if float(
+                    selected_edition["pages"]
+                ) > 0:
+
+                    st.write(
+                        f"**Pages:** "
+                        f"{int(selected_edition['pages'])}"
+                    )
+
+
+            if pd.notna(
+                selected_edition.get(
+                    "rating"
+                )
+            ):
+
+                st.write(
+                    f"**Goodreads rating:** "
+                    f"{float(selected_edition['rating']):.2f}"
+                )
+
+
+            if st.button(
+                "Use this book",
+                type="primary"
+            ):
+
+                st.session_state[
+                    "source_book_id"
+                ] = int(
+                    selected_edition[
+                        "book_id"
+                    ]
+                )
+
+
+                st.success(
+                    "Book selected!"
+                )
+
+
+                st.rerun()
+
 
 # ============================================================
 # MY BOOKS
@@ -669,6 +883,7 @@ elif page == "📖 My Books":
     st.title(
         "📖 My Books"
     )
+
 
     st.write(
         "Add books you have read and rate them."
@@ -681,93 +896,149 @@ elif page == "📖 My Books":
     )
 
 
-    results = search_books(
-        query
-    )
+    if query:
+
+        results = search_editions(
+            query
+        )
 
 
-    if not results.empty:
+        if not results.empty:
 
-        options = {}
+            options = {}
 
-        for _, row in results.iterrows():
 
-            options[
-                int(row["book_id"])
-            ] = (
-                f"{row['title']} "
-                f"— {row['author']}"
+            for _, row in results.iterrows():
+
+                edition_id = int(
+                    row["edition_id"]
+                )
+
+
+                label = (
+                    f"{row['title']} — "
+                    f"{row['author']}"
+                )
+
+
+                if pd.notna(
+                    row.get("bookformat")
+                ):
+
+                    label += (
+                        f" — {row['bookformat']}"
+                    )
+
+
+                options[
+                    edition_id
+                ] = label
+
+
+            selected_edition_id = (
+                st.selectbox(
+                    "Select edition",
+                    list(
+                        options.keys()
+                    ),
+                    format_func=lambda x:
+                        options[x]
+                )
             )
 
 
-        selected_id = st.selectbox(
-            "Book",
-            list(options.keys()),
-            format_func=lambda x:
-                options[x]
-        )
+            selected_edition = (
+                results[
+                    results[
+                        "edition_id"
+                    ]
+                    == selected_edition_id
+                ]
+                .iloc[0]
+            )
 
 
-        rating = st.slider(
-            "Your rating",
-            min_value=1,
-            max_value=5,
-            value=5
-        )
+            rating = st.slider(
+                "Your rating",
+                min_value=1,
+                max_value=5,
+                value=5
+            )
 
 
-        if st.button(
-            "Save book"
-        ):
+            if st.button(
+                "Save book"
+            ):
 
-            try:
-
-                # Reading history
-                supabase.table(
-                    "reading_history"
-                ).upsert(
-                    {
-                        "user_id": user_id,
-                        "book_id": int(
-                            selected_id
-                        ),
-                        "status": "read"
-                    },
-                    on_conflict=(
-                        "user_id,book_id"
-                    )
-                ).execute()
+                selected_book_id = int(
+                    selected_edition[
+                        "book_id"
+                    ]
+                )
 
 
-                # User rating
-                supabase.table(
-                    "book_ratings"
-                ).upsert(
-                    {
-                        "user_id": user_id,
-                        "book_id": int(
-                            selected_id
-                        ),
-                        "rating": int(
-                            rating
+                try:
+
+                    # ----------------------------------------
+                    # Reading history
+                    # ----------------------------------------
+
+                    (
+                        supabase
+                        .table(
+                            "reading_history"
                         )
-                    },
-                    on_conflict=(
-                        "user_id,book_id"
+                        .upsert(
+                            {
+                                "user_id": user_id,
+                                "book_id":
+                                    selected_book_id,
+                                "status": "read"
+                            },
+                            on_conflict=(
+                                "user_id,book_id"
+                            )
+                        )
+                        .execute()
                     )
-                ).execute()
 
 
-                st.success(
-                    "Book and rating saved!"
-                )
+                    # ----------------------------------------
+                    # Rating
+                    # ----------------------------------------
+
+                    (
+                        supabase
+                        .table(
+                            "book_ratings"
+                        )
+                        .upsert(
+                            {
+                                "user_id": user_id,
+                                "book_id":
+                                    selected_book_id,
+                                "rating": int(
+                                    rating
+                                )
+                            },
+                            on_conflict=(
+                                "user_id,book_id"
+                            )
+                        )
+                        .execute()
+                    )
 
 
-            except Exception as e:
+                    st.success(
+                        "Book and rating saved!"
+                    )
 
-                st.error(
-                    f"Could not save: {e}"
-                )
+
+                except Exception as e:
+
+                    st.error(
+                        f"Could not save: {e}"
+                    )
 
 
 # ============================================================
@@ -788,23 +1059,37 @@ elif page == "🎯 Recommendations":
 
         st.warning(
             """
-            First go to "Find a Book" and
-            select a book.
+            First go to "Find a Book"
+            and select a book.
             """
         )
 
         st.stop()
 
 
-    source = books.loc[
-        books["book_id"]
-        == st.session_state.source_book_id
-    ].iloc[0]
+    source_book_id = int(
+        st.session_state.source_book_id
+    )
+
+
+    source = get_book(
+        source_book_id
+    )
+
+
+    if source is None:
+
+        st.error(
+            "Selected book could not be found."
+        )
+
+        st.stop()
 
 
     st.write(
-        f"Recommendations based on:"
+        "Recommendations based on:"
     )
+
 
     st.subheader(
         f"{source['title']} — "
@@ -812,12 +1097,19 @@ elif page == "🎯 Recommendations":
     )
 
 
-    recommendations = (
-        recommend_books(
-            st.session_state.source_book_id,
-            n=10
-        )
+    recommendations = recommend_books(
+        source_book_id,
+        n=10
     )
+
+
+    if recommendations.empty:
+
+        st.warning(
+            "No recommendations found."
+        )
+
+        st.stop()
 
 
     for _, row in recommendations.iterrows():
@@ -835,22 +1127,46 @@ elif page == "🎯 Recommendations":
                 row["title"]
             )
 
+
             st.write(
                 f"**Author:** "
                 f"{row['author']}"
             )
 
-            st.write(
-                f"**Similarity:** "
-                f"{row['similarity']:.1%}"
-            )
 
-
-            if row["genre_list"]:
+            if pd.notna(
+                row.get("similarity")
+            ):
 
                 st.write(
-                    f"**Genres:** "
-                    f"{', '.join(row['genre_list'])}"
+                    f"**Similarity:** "
+                    f"{float(row['similarity']):.1%}"
+                )
+
+
+            if row.get(
+                "genre_list"
+            ):
+
+                genres = row[
+                    "genre_list"
+                ]
+
+                if isinstance(
+                    genres,
+                    str
+                ):
+
+                    genres = genres.split(
+                        "||"
+                    )
+
+
+                st.write(
+                    "**Genres:** "
+                    + ", ".join(
+                        genres
+                    )
                 )
 
 
@@ -886,28 +1202,31 @@ elif page == "🎯 Recommendations":
 
                 try:
 
-                    supabase.table(
-                        "recommendation_feedback"
-                    ).insert(
-                        {
-                            "user_id": user_id,
+                    (
+                        supabase
+                        .table(
+                            "recommendation_feedback"
+                        )
+                        .insert(
+                            {
+                                "user_id":
+                                    user_id,
 
-                            "source_book_id":
-                                int(
-                                    st.session_state
-                                    .source_book_id
-                                ),
+                                "source_book_id":
+                                    source_book_id,
 
-                            "recommended_book_id":
-                                book_id,
+                                "recommended_book_id":
+                                    book_id,
 
-                            "rating":
-                                int(rating),
+                                "rating":
+                                    int(rating),
 
-                            "helpful":
-                                helpful == "Yes"
-                        }
-                    ).execute()
+                                "helpful":
+                                    helpful == "Yes"
+                            }
+                        )
+                        .execute()
+                    )
 
 
                     st.success(
@@ -954,43 +1273,58 @@ elif page == "⭐ My Ratings":
         )
 
 
-        if ratings:
-
-            ratings_df = pd.DataFrame(
-                ratings
-            )
-
-
-            ratings_df = ratings_df.merge(
-                books[
-                    [
-                        "book_id",
-                        "title",
-                        "author"
-                    ]
-                ],
-                on="book_id",
-                how="left"
-            )
-
-
-            st.dataframe(
-                ratings_df[
-                    [
-                        "title",
-                        "author",
-                        "rating",
-                        "created_at"
-                    ]
-                ],
-                use_container_width=True
-            )
-
-        else:
+        if not ratings:
 
             st.info(
                 "You have not rated any books yet."
             )
+
+            st.stop()
+
+
+        ratings_df = pd.DataFrame(
+            ratings
+        )
+
+
+        book_ids = (
+            ratings_df[
+                "book_id"
+            ]
+            .astype(int)
+            .tolist()
+        )
+
+
+        books_df = get_books(
+            book_ids
+        )
+
+
+        ratings_df = ratings_df.merge(
+            books_df[
+                [
+                    "book_id",
+                    "title",
+                    "author"
+                ]
+            ],
+            on="book_id",
+            how="left"
+        )
+
+
+        st.dataframe(
+            ratings_df[
+                [
+                    "title",
+                    "author",
+                    "rating",
+                    "created_at"
+                ]
+            ],
+            use_container_width=True
+        )
 
 
     except Exception as e:
